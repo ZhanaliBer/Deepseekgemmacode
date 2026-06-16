@@ -73,7 +73,8 @@ def split_land_project_files(txt_files):
         logging.warning("⚠️ Найден 'Землеустроительный проект', но не найден 'Бланк заказа'. Диапазон не вырезан из анализа Gemma.")
         return txt_files, None
 
-    project_files = txt_files[start_idx:end_idx + 1]
+    project_files = txt_files[start_idx:end_idx]
+
     pdf_numbers = [extract_file_number(file_name) for file_name in project_files]
     if any(number is None for number in pdf_numbers):
         logging.warning("⚠️ Не удалось определить номера PDF для блока 'Землеустроительный проект'. Диапазон не вырезан из анализа Gemma.")
@@ -88,7 +89,7 @@ def split_land_project_files(txt_files):
             }
         ]
     }
-    gemma_files = txt_files[:start_idx] + txt_files[end_idx + 1:]
+    gemma_files = txt_files[:start_idx] + txt_files[end_idx:]
 
     logging.info(
         f"📌 Блок 'Землеустроительный проект' найден: PDF {pdf_numbers}. "
