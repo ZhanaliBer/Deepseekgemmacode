@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import json_to_docs
 
 # Отключаем предупреждения о небезопасном соединении
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -47,6 +48,93 @@ session.mount('https://', HTTPAdapter(max_retries=retries))
 def sanitize_folder_name(name):
     cleaned = re.sub(r'[\\/*?:"<>|]', "", name)
     return cleaned.strip()
+
+def extract_file_number(file_name):
+    match = re.search(r'\d+', file_name)
+    return int(match.group()) if match else None
+
+def split_land_project_files(txt_files):
+    start_idx = None
+    for idx, file_name in enumerate(txt_files):
+        if "землеустроительный проект" in file_name.lower():
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return txt_files, None
+
+    end_idx = None
+    for idx in range(start_idx, len(txt_files)):
+        if "бланк заказа" in txt_files[idx].lower():
+            end_idx = idx
+            break
+
+    if end_idx is None:
+        logging.warning("⚠️ Найден 'Землеустроительный проект', но не найден 'Бланк заказа'. Диапазон не вырезан из анализа Gemma.")
+        return txt_files, None
+
+    project_files = txt_files[start_idx:end_idx + 1]
+    pdf_numbers = [extract_file_number(file_name) for file_name in project_files]
+    if any(number is None for number in pdf_numbers):
+        logging.warning("⚠️ Не удалось определить номера PDF для блока 'Землеустроительный проект'. Диапазон не вырезан из анализа Gemma.")
+        return txt_files, None
+
+    manual_folder = {
+        "name": "Землеустроительный проект",
+        "content": [
+            {
+                "name": "Землеустроительный проект.pdf",
+                "pdfs": pdf_numbers
+            }
+        ]
+    }
+    gemma_files = txt_files[:start_idx] + txt_files[end_idx + 1:]
+
+    logging.info(
+        f"📌 Блок 'Землеустроительный проект' найден: PDF {pdf_numbers}. "
+        "Этот диапазон не будет отправлен Gemma и будет добавлен в JSON вручную."
+    )
+    return gemma_files, manual_folder
+
+def save_structure_json(json_data):
+    sort_structure_by_pdf_numbers(json_data)
+
+    json_path = BASE_DIR / "structure.json"
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=4)
+
+    logging.info(f"✅ Структура успешно сгенерирована и сохранена в {json_path}")
+
+    # --- ВЫВОД РЕЗУЛЬТАТОВ СКЛЕЙКИ В КОНСОЛЬ ---
+    print("\n" + "="*70)
+    print("ПЛАН СБОРКИ ДОКУМЕНТОВ:")
+    print("="*70)
+    for folder in json_data.get('files', []):
+        for doc in folder.get('content', []):
+            if len(doc.get('pdfs', [])) > 1:
+                print(f"СШИВКА: Файлы {doc['pdfs']} ---> в один документ '{doc['name']}' (Папка: {folder['name']})")
+            else:
+                print(f"ОДИНОЧНЫЙ: Файл {doc['pdfs']} ---> '{doc['name']}' (Папка: {folder['name']})")
+    print("="*70 + "\n")
+
+    return json_data
+
+def get_first_pdf_number(item):
+    numbers = []
+
+    if "pdfs" in item:
+        numbers = item.get("pdfs", [])
+    else:
+        for document in item.get("content", []):
+            numbers.extend(document.get("pdfs", []))
+
+    return min(numbers) if numbers else 10**9
+
+def sort_structure_by_pdf_numbers(json_data):
+    for folder in json_data.get("files", []):
+        folder.get("content", []).sort(key=get_first_pdf_number)
+
+    json_data.get("files", []).sort(key=get_first_pdf_number)
 
 def get_file_as_base64(file_path):
     if str(file_path).lower().endswith('.pdf'):
@@ -129,6 +217,11 @@ def generate_structure_json():
         logging.error("❌ Папка temp пуста. Выполнение невозможно.")
         return None
 
+    txt_files, manual_folder = split_land_project_files(txt_files)
+
+    if not txt_files and manual_folder:
+        return save_structure_json({"files": [manual_folder]})
+
     docs_info = ""
     for f_name in txt_files:
         file_path = TEMP_DIR / f_name
@@ -195,26 +288,10 @@ def generate_structure_json():
             answer = answer[:-3]
             
         json_data = json.loads(answer)
-        
-        json_path = BASE_DIR / "structure.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=4)
-            
-        logging.info(f"✅ Структура успешно сгенерирована и сохранена в {json_path}")
-        
-        # --- ВЫВОД РЕЗУЛЬТАТОВ СКЛЕЙКИ В КОНСОЛЬ ---
-        print("\n" + "="*70)
-        print("📄 ПЛАН СБОРКИ ДОКУМЕНТОВ:")
-        print("="*70)
-        for folder in json_data.get('files', []):
-            for doc in folder.get('content', []):
-                if len(doc.get('pdfs', [])) > 1:
-                    print(f"🔗 СШИВКА: Файлы {doc['pdfs']} ---> в один документ '{doc['name']}' (Папка: {folder['name']})")
-                else:
-                    print(f"📄 ОДИНОЧНЫЙ: Файл {doc['pdfs']} ---> '{doc['name']}' (Папка: {folder['name']})")
-        print("="*70 + "\n")
-        
-        return json_data
+        if manual_folder:
+            json_data.setdefault("files", []).append(manual_folder)
+
+        return save_structure_json(json_data)
 
     except json.JSONDecodeError:
         logging.error(f"❌ Ошибка парсинга JSON. Ответ модели:\n{answer}")
@@ -293,7 +370,12 @@ def main():
     json_structure = generate_structure_json()
     
     if json_structure:
-        logging.info("✅ ПЛАН СОСТАВЛЕН. Скрипт ожидает разработки Этапа 4 (физической сборки).")
+        logging.info("✅ ПЛАН СОСТАВЛЕН. Запускаю сборку PDF по structure.json...")
+        try:
+            json_to_docs.main()
+            logging.info("✅ PDF успешно собраны в папку result.")
+        except Exception as e:
+            logging.error(f"❌ Ошибка сборки PDF: {e}")
     else:
         logging.error("❌ Остановка выполнения: не удалось получить структуру от нейросети.")
 
