@@ -1,12 +1,12 @@
 import os
 import base64
 import requests
-import shutil
 import re
 import fitz
 import json
 import logging
 import pandas as pd
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 import urllib3
@@ -27,24 +27,27 @@ OCR_KEY = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")
 GEMMA_KEY = os.getenv("GEMMA_KEY", "sk-YuIk9jJ94NJg-3lDarn6LQ")    
 URL = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
 
-# Локальные директории для работы
+# Локальные директории
 BASE_DIR = Path(__file__).parent.resolve()
 INPUT_DIR = BASE_DIR / "berik"  
 OUTPUT_DIR = BASE_DIR / "docs"  
 TEMP_DIR = BASE_DIR / "temp"    
 EXCEL_FILE = BASE_DIR / "types.xlsx"
 
-# Настройка HTTP-сессии с автоматическими повторами при сбоях сети
+# Настройка HTTP-сессии (разрешены повторы для POST-запросов)
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retries = Retry(
+    total=10, 
+    backoff_factor=2, 
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+)
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# Функция очистки имени от запрещенных системных символов
 def sanitize_folder_name(name):
     cleaned = re.sub(r'[\\/*?:"<>|]', "", name)
     return cleaned.strip()
 
-# Функция конвертации файла (или первой страницы PDF) в формат base64
 def get_file_as_base64(file_path):
     if str(file_path).lower().endswith('.pdf'):
         doc = fitz.open(file_path)
@@ -57,7 +60,7 @@ def get_file_as_base64(file_path):
         with open(file_path, "rb") as f:
             return base64.b64encode(f.read()).decode('utf-8')
 
-# Функция извлечения текста из изображения через API DeepSeek OCR
+# ЭТАП 1: Извлечение текста
 def ocr_image_to_text(file_path):
     img_b64 = get_file_as_base64(file_path)
     payload = {
@@ -74,7 +77,7 @@ def ocr_image_to_text(file_path):
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
-# Функция визуального определения типа документа через API Gemma
+# ЭТАП 2: Классификация (выбор названия)
 def analyze_document_by_image(file_path, types_list):
     img_b64 = get_file_as_base64(file_path)
     if types_list:
@@ -114,24 +117,124 @@ def analyze_document_by_image(file_path, types_list):
         logging.error(f"Ошибка визуальной классификации: {e}")
         return "ОШИБКА"
 
-# Главная функция оркестрации: создание папок, чтение эталона и последовательная обработка
+# ЭТАП 3: Анализ структуры на основе текста
+# ЭТАП 3: Анализ структуры на основе текста
+def generate_structure_json():
+    logging.info("🧠 ЭТАП 3: Анализ текста и генерация JSON-структуры...")
+    
+    txt_files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.txt')]
+    txt_files.sort(key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
+
+    if not txt_files:
+        logging.error("❌ Папка temp пуста. Выполнение невозможно.")
+        return None
+
+    docs_info = ""
+    for f_name in txt_files:
+        file_path = TEMP_DIR / f_name
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+            
+        # Передаем начало и конец текста для выявления "шапок" и "подписей"
+        if len(text) > 1000:
+            short_text = text[:500] + "\n...[ТЕКСТ СОКРАЩЕН]...\n" + text[-500:]
+        else:
+            short_text = text
+            
+        docs_info += f"ФАЙЛ: {f_name}\nТЕКСТ:\n{short_text}\n\n"
+
+    system_prompt = """Ты архитектор данных. Твоя задача — проанализировать тексты страниц и сгруппировать их в строгий JSON.
+
+ПРАВИЛА АНАЛИЗА И СШИВАНИЯ (КРИТИЧЕСКИ ВАЖНО):
+1. Анализ текста (Разделяй и властвуй):
+   - Если файлы идут подряд и относятся к одному типу (например, четыре файла "Заявление"), ВНИМАТЕЛЬНО ИЗУЧИ ТЕКСТ.
+   - СШИВАЙ их в один массив (например, "pdfs": [1, 2]), ТОЛЬКО если текст логически перетекает (на первой странице нет подписи, а на второй нет новой "шапки" Кому/От кого).
+   - РАЗДЕЛЯЙ их на разные документы (разные объекты внутри "content"), если видишь начало нового документа: новую шапку (ФИО, реквизиты), дату, новую печать или повторное слово "ЗАЯВЛЕНИЕ" в начале страницы. В таком случае делай два разных документа, например "pdfs": [1, 2] и "pdfs": [3, 4].
+2. Жесткое именование:
+   - Значение "name" для папки ДОЛЖНО СТРОГО совпадать с названием самого документа. Никаких выдуманных названий! Если файлы называются "Заявление", папка должна называться "Заявление".
+
+Верни ТОЛЬКО валидный JSON без markdown-разметки. Формат:
+{
+    "files": [
+        {
+            "name": "Точное_название_документа",
+            "content": [
+                {
+                    "name": "Название_документа.pdf",
+                    "pdfs": [1, 2]
+                },
+                {
+                    "name": "Название_документа.pdf",
+                    "pdfs": [3, 4]
+                }
+            ]
+        }
+    ]
+}"""
+
+    payload = {
+        "model": "gemma4",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": docs_info}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 4000
+    }
+
+    try:
+        headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
+        resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=120)
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"].strip()
+        
+        # Очистка от маркдауна
+        if answer.startswith("```json"):
+            answer = answer.replace("```json\n", "", 1)
+        if answer.endswith("```"):
+            answer = answer[:-3]
+            
+        json_data = json.loads(answer)
+        
+        json_path = BASE_DIR / "structure.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=4)
+            
+        logging.info(f"✅ Структура успешно сгенерирована и сохранена в {json_path}")
+        
+        # --- ВЫВОД РЕЗУЛЬТАТОВ СКЛЕЙКИ В КОНСОЛЬ ---
+        print("\n" + "="*70)
+        print("📄 ПЛАН СБОРКИ ДОКУМЕНТОВ:")
+        print("="*70)
+        for folder in json_data.get('files', []):
+            for doc in folder.get('content', []):
+                if len(doc.get('pdfs', [])) > 1:
+                    print(f"🔗 СШИВКА: Файлы {doc['pdfs']} ---> в один документ '{doc['name']}' (Папка: {folder['name']})")
+                else:
+                    print(f"📄 ОДИНОЧНЫЙ: Файл {doc['pdfs']} ---> '{doc['name']}' (Папка: {folder['name']})")
+        print("="*70 + "\n")
+        
+        return json_data
+
+    except json.JSONDecodeError:
+        logging.error(f"❌ Ошибка парсинга JSON. Ответ модели:\n{answer}")
+        return None
+    except Exception as e:
+        logging.error(f"❌ Ошибка генерации структуры: {e}")
+        return None
 def main():
-    # Гарантируем, что базовые папки существуют
     INPUT_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
     
-    logging.info("Система инициализирована. Базовый шаблон готов к работе.")
-
     valid_filenames = [f for f in os.listdir(INPUT_DIR) if os.path.isfile(os.path.join(INPUT_DIR, f)) and not f.startswith('.')]
     if not valid_filenames:
-        logging.error(f"❌ Папка {INPUT_DIR.name} пуста. Пожалуйста, добавьте документы.")
+        logging.error(f"❌ Папка {INPUT_DIR.name} пуста.")
         return
 
-    # Защита хронологии: сортируем файлы по числам в их названиях
     valid_filenames.sort(key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
+    total_files = len(valid_filenames)
 
-    # Загружаем список типов документов из Excel
     allowed_types = []
     if EXCEL_FILE.exists():
         try:
@@ -140,42 +243,59 @@ def main():
             if column_name in df.columns:
                 raw_list = df[column_name].dropna().astype(str).str.strip().unique().tolist()
                 allowed_types = [t for t in raw_list if t and not t.startswith("№")]
-                logging.info(f"✅ Excel-файл загружен ({len(allowed_types)} категорий).")
         except Exception as e:
             logging.error(f"⚠️ Ошибка чтения Excel файла: {e}")
 
-    # ---------------------------------------------------------
-    # ЭТАП 1: Создание текстовых слепков (Последовательная обработка)
-    # ---------------------------------------------------------
-    total_files = len(valid_filenames)
-    logging.info(f"🚀 ЗАПУСК ЭТАПА 1: Считывание {total_files} файлов...")
+    # --- ПРОВЕРКА КЭША В ПАПКЕ TEMP ---
+    temp_files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.txt')]
     
-    for idx, f_name in enumerate(valid_filenames, 1):
-        f_path = INPUT_DIR / f_name
-        logging.info(f"📄 Сканирование файла [{idx}/{total_files}]: {f_name}")
-        
-        # 1. Извлечение текста (DeepSeek OCR)
-        try:
-            extracted_text = ocr_image_to_text(str(f_path))
-            if not extracted_text.strip():
-                extracted_text = "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"
-        except Exception as e:
-            logging.error(f"Ошибка чтения OCR для {f_name}: {e}")
-            extracted_text = "[ОШИБКА РАСПОЗНАВАНИЯ]"
+    if len(temp_files) == total_files and total_files > 0:
+        logging.info("♻️ [КЭШ АКТИВЕН] Обнаружены готовые слепки для всех файлов.")
+        logging.info("⏩ Этап 1 (OCR) и Этап 2 (Классификация) пропущены.")
+    else:
+        # Если количество файлов не совпадает, очищаем temp для чистого старта
+        if temp_files:
+            logging.info("🧹 Обнаружены неполные/старые данные в temp. Очистка папки...")
+            for f in temp_files:
+                os.remove(TEMP_DIR / f)
 
-        # 2. Определение названия (Gemma)
-        doc_name = analyze_document_by_image(str(f_path), allowed_types)
-        
-        # 3. Формирование имени и сохранение в temp
-        safe_filename = sanitize_folder_name(f"{idx} {doc_name}")
-        txt_filepath = TEMP_DIR / f"{safe_filename}.txt"
-        
-        with open(txt_filepath, 'w', encoding='utf-8') as f:
-            f.write(extracted_text)
+        logging.info(f"🚀 ЗАПУСК ЭТАПОВ 1 И 2: Обработка {total_files} файлов...")
+        for idx, f_name in enumerate(valid_filenames, 1):
+            f_path = INPUT_DIR / f_name
             
-        logging.info(f"💾 Сохранен слепок: {safe_filename}.txt")
+            # Аппаратная задержка
+            time.sleep(3) 
+            
+            logging.info(f"⚙️ Обработка [{idx}/{total_files}]: {f_name}")
+            
+            # ЭТАП 1: OCR
+            try:
+                extracted_text = ocr_image_to_text(str(f_path))
+                if not extracted_text.strip():
+                    extracted_text = "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"
+            except Exception as e:
+                logging.error(f"Ошибка чтения OCR для {f_name}: {e}")
+                extracted_text = "[ОШИБКА РАСПОЗНАВАНИЯ]"
 
-    logging.info("🎉 ЭТАП 1 ЗАВЕРШЕН. Вся база перенесена в текстовый формат.")
+            # ЭТАП 2: Gemma (Название)
+            doc_name = analyze_document_by_image(str(f_path), allowed_types)
+            
+            # Запись слепка
+            safe_filename = sanitize_folder_name(f"{idx} {doc_name}")
+            txt_filepath = TEMP_DIR / f"{safe_filename}.txt"
+            
+            with open(txt_filepath, 'w', encoding='utf-8') as f:
+                f.write(extracted_text)
+
+        logging.info("✅ ЭТАПЫ 1 И 2 ЗАВЕРШЕНЫ. Тексты сохранены в папке temp.")
+    
+    # ЭТАП 3: Анализ структуры
+    json_structure = generate_structure_json()
+    
+    if json_structure:
+        logging.info("✅ ПЛАН СОСТАВЛЕН. Скрипт ожидает разработки Этапа 4 (физической сборки).")
+    else:
+        logging.error("❌ Остановка выполнения: не удалось получить структуру от нейросети.")
 
 if __name__ == "__main__":
     main()
