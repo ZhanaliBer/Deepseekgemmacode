@@ -1,0 +1,353 @@
+import os
+import time
+import base64
+import requests
+import shutil
+import re
+import fitz
+import json
+import logging
+import pandas as pd
+from pathlib import Path
+from dotenv import load_dotenv
+
+from concurrent.futures import ThreadPoolExecutor
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+load_dotenv()
+OCR_KEY = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")       
+GEMMA_KEY = os.getenv("GEMMA_KEY", "sk-YuIk9jJ94NJg-3lDarn6LQ")     
+URL = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
+
+# Локальные папки для работы в IDE
+BASE_DIR = Path(__file__).parent.resolve()
+INPUT_DIR = BASE_DIR / "berik"  
+OUTPUT_DIR = BASE_DIR / "docs"  
+EXCEL_FILE = BASE_DIR / "types.xlsx"
+
+# Умная сессия с принудительным разрешением повторов для POST-запросов
+session = requests.Session()
+retries = Retry(
+    total=10, 
+    backoff_factor=3,  
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(['GET', 'POST'])  
+)
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+def sanitize_folder_name(name):
+    cleaned = re.sub(r'[\\/*?:"<>|]', "", name)
+    return cleaned.strip()
+
+def get_file_as_base64(file_path):
+    if str(file_path).lower().endswith('.pdf'):
+        doc = fitz.open(file_path)
+        page = doc.load_page(0)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_bytes = pix.tobytes("jpeg")
+        doc.close()
+        return base64.b64encode(img_bytes).decode('utf-8')
+    else:
+        with open(file_path, "rb") as f:
+            return base64.b64encode(f.read()).decode('utf-8')
+
+def ocr_image_to_text(file_path):
+    img_b64 = get_file_as_base64(file_path)
+    payload = {
+        "model": "deepseek-ocr",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Extract all text from this image. Return ONLY the text."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        ]}],
+        "temperature": 0.0,
+        "max_tokens": 3000  
+    }
+    headers = {"Authorization": f"Bearer {OCR_KEY}", "Content-Type": "application/json"}
+    resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+def group_files_with_gemma(extracted_data):
+    docs_info = ""
+    for item in extracted_data:
+        text = item['text']
+        # ОПТИМИЗАЦИЯ КОНТЕКСТА: берем по 300 символов, чтобы не перегрузить сервер
+        short_text = text[:300] + " ... " + text[-300:] if len(text) > 600 else text
+        docs_info += f"ФАЙЛ: {os.path.basename(item['filename'])}\nТЕКСТ:\n{short_text}\n\n"
+        
+    payload = {
+        "model": "gemma4",
+        "messages": [
+            {"role": "system", "content": """Ты экспертный сортировщик документов. Перед тобой тексты страниц в хронологическом порядке. Твоя задача — распределить их по группам, строго соблюдая иерархию правил.
+            
+            0. АБСОЛЮТНЫЙ ПРИОРИТЕТ (МОНОЛИТ "ЗЕМЛЕУСТРОИТЕЛЬНЫЙ ПРОЕКТ"): Если ты видишь в тексте 'Землеустроительный проект', 'Раздел 0' или 'Нулевой раздел', ты ОБЯЗАН склеить этот лист и абсолютно все последующие листы в один гигантский документ. Эта непрерывная склейка включает в себя ВСЕ листы вплоть до того файла, который идет ровно перед листом 'Бланк заказа'. Лист 'Бланк заказа' отрезается и начинает новый отдельный документ.
+            
+            1. ВЫСШИЙ ПРИОРИТЕТ РАЗДЕЛЕНИЯ (КОЛОНТИТУЛЫ И ЗАГОЛОВКИ): Вне правила 0, любые колонтитулы и заголовки ('ЗАЯВЛЕНИЕ', 'ӨТІНІШ', 'ДОГОВОР', 'АКТ', 'СПРАВКА') имеют максимальную силу. Это 100% старт нового документа. Никакие другие маркеры не могут отменить это разделение.
+            
+            2. ВЫСШИЙ ПРИОРИТЕТ СКЛЕЙКИ (ЛОГОТИПЫ): Если четкого титула нет, но присутствует редкий стилизованный логотип компании/проекта — эти листы 100% идут вместе. Это правило перебивает простую текстовую нумерацию или графику.
+            
+            3. ИСКЛЮЧЕНИЕ ДЛЯ СТАНДАРТНЫХ БЛАНКОВ: Обычные текстовые шапки (реквизиты) на заявлениях не склеивай.
+            
+            4. ПРОДОЛЖЕНИЕ ТЕКСТА: Если нет колонтитулов и логотипов, а текст содержит 'Страница 2' — крепи его к предыдущему файлу.
+            
+            5. ГРАФИКА: Файлы '[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]' остаются одиночными (кроме случаев из пункта 0, там они вклеиваются в проект).
+            
+            Верни ТОЛЬКО валидный JSON в формате списка списков. Например: [["file1.jpg"], ["file2.jpg", "file3.jpg"]]"""},
+            {"role": "user", "content": docs_info}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 3500
+    }
+    
+    headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
+    
+    for attempt in range(5):
+        try:
+            resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=150)
+            if resp.status_code == 429:
+                wait_time = 20 * (attempt + 1)
+                logging.warning(f"⏳ Сервер перегружен (429 на ЭТАПЕ 2). Попытка {attempt+1}/5. Ожидаем {wait_time} сек...")
+                time.sleep(wait_time)
+                continue
+                
+            resp.raise_for_status()
+            answer = resp.json()["choices"][0]["message"]["content"]
+            json_match = re.search(r'\[.*\]', answer, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return [[os.path.basename(item['filename'])] for item in extracted_data]
+            
+        except Exception as e:
+            logging.error(f"⚠️ Ошибка на итерации {attempt+1} при сортировке Джеммой: {e}")
+            time.sleep(5)
+            
+    return [[os.path.basename(item['filename'])] for item in extracted_data]
+
+def analyze_document_by_image(file_path, types_list):
+    img_b64 = get_file_as_base64(file_path)
+    if types_list:
+        numbered_types = [f"{i+1}. {t}" for i, t in enumerate(types_list)]
+        types_str = "\n".join(numbered_types)
+        system_prompt = (
+            f"Ты строгий визуальный классификатор документов. Перед тобой список разрешенных категорий из Excel:\n{types_str}\n\n"
+            f"Внимательно посмотри на изображение документа и определи его тип.\n"
+            f"Учитывай казахский язык (ӨТІНІШ -> Заявление). Если это чертеж/схема без текста — выбери подходящую категорию.\n"
+            f"В качестве ответа верни ТОЛЬКО ЦИФРУ номера пункта."
+        )
+    else:
+        system_prompt = "Посмотри на картинку и определи тип документа. Верни только одно-два слова на русском языке."
+
+    payload = {
+        "model": "gemma4",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": system_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+        ]}],
+        "temperature": 0.0, 
+        "max_tokens": 5  
+    }
+    
+    headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
+    
+    for attempt in range(5):
+        try:
+            resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=45)
+            if resp.status_code == 429:
+                wait_time = 15 * (attempt + 1)
+                logging.warning(f"⏳ Сервер перегружен (429 на ЭТАПЕ 3). Попытка {attempt+1}/5. Ожидаем {wait_time} сек...")
+                time.sleep(wait_time)
+                continue
+                
+            resp.raise_for_status()
+            raw_answer = resp.json()["choices"][0]["message"]["content"].strip()
+            match = re.search(r'\d+', raw_answer)
+            if types_list and match:
+                index = int(match.group(0)) - 1
+                if 0 <= index < len(types_list):
+                    return types_list[index]
+            return raw_answer if not types_list else "НЕИЗВЕСТНО"
+            
+        except Exception as e:
+            logging.error(f"⚠️ Ошибка на итерации {attempt+1} визуальной классификации: {e}")
+            time.sleep(5)
+            
+    return "ОШИБКА"
+
+def merge_and_save_pdfs(files_list, source_dir, target_folder, final_name):
+    merged_pdf = fitz.open()
+    for f_name in files_list:
+        f_path = os.path.join(source_dir, f_name)
+        try:
+            if f_name.lower().endswith('.pdf'):
+                temp_doc = fitz.open(f_path)
+                for page in temp_doc:
+                    merged_pdf.insert_pdf(temp_doc, from_page=page.number, to_page=page.number)
+                temp_doc.close()
+            else:
+                img_doc = fitz.open(f_path)
+                pdf_bytes = img_doc.convert_to_pdf()
+                temp_doc = fitz.open("pdf", pdf_bytes)
+                merged_pdf.insert_pdf(temp_doc)
+                temp_doc.close()
+                img_doc.close()
+        except Exception as e:
+            logging.error(f"❌ Критическая ошибка структуры в файле {f_name}: {e}. Пропускаем страницу.")
+            continue
+            
+    if len(merged_pdf) > 0:
+        output_path = os.path.join(target_folder, f"{final_name}.pdf")
+        merged_pdf.save(output_path)
+        merged_pdf.close()
+        return True
+    else:
+        merged_pdf.close()
+        return False
+
+def main():
+    INPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    
+    # === ПРОТОКОЛ "ЧИСТАЯ ПАПКА" (Абсолютная стерилизация имен) ===
+    logging.info("🧹 Запуск стерилизации имен входных файлов...")
+    raw_files = [f for f in os.listdir(INPUT_DIR) if os.path.isfile(os.path.join(INPUT_DIR, f)) and not f.startswith('.')]
+    
+    if raw_files:
+        # Естественная сортировка, чтобы файл _2 шел перед _10
+        raw_files.sort(key=lambda x: [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', x)])
+        
+        # Шаг 1: Переименовываем во временные имена (броня от конфликтов перезаписи)
+        temp_names = []
+        for i, old_name in enumerate(raw_files, start=1):
+            ext = os.path.splitext(old_name)[1].lower()
+            temp_name = f"__jarvis_{i}{ext}"
+            os.rename(INPUT_DIR / old_name, INPUT_DIR / temp_name)
+            temp_names.append(temp_name)
+            
+        # Шаг 2: Присваиваем идеальные порядковые номера (1.pdf, 2.pdf...)
+        for i, temp_name in enumerate(temp_names, start=1):
+            ext = os.path.splitext(temp_name)[1].lower()
+            final_name = f"{i}{ext}"
+            os.rename(INPUT_DIR / temp_name, INPUT_DIR / final_name)
+            
+    # Собираем уже чистые файлы для работы
+    valid_filenames = [f for f in os.listdir(INPUT_DIR) if os.path.isfile(os.path.join(INPUT_DIR, f)) and not f.startswith('.')]
+    valid_filenames.sort(key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0)
+    
+    if not valid_filenames:
+        logging.error(f"❌ Папка {INPUT_DIR.name} пуста. Пожалуйста, добавьте документы для сортировки.")
+        return
+
+    logging.info(f"📥 Найдено файлов для обработки: {len(valid_filenames)} (Все переименованы по порядку)")
+
+    allowed_types = []
+    if EXCEL_FILE.exists():
+        try:
+            df = pd.read_excel(EXCEL_FILE)
+            column_name = "Название документа"
+            if column_name in df.columns:
+                raw_list = df[column_name].dropna().astype(str).str.strip().unique().tolist()
+                allowed_types = [t for t in raw_list if t and not t.startswith("№")]
+                logging.info(f"✅ Успешно загружен Excel-файл ({len(allowed_types)} категорий).")
+        except Exception as e:
+            logging.error(f"⚠️ Ошибка чтения Excel файла: {e}")
+    else:
+        logging.warning(f"⚠️ Файл {EXCEL_FILE.name} не найден. Классификация будет работать без строгого списка.")
+
+    logging.info(f"👁️ ЭТАП 1: Запуск параллельного OCR через DeepSeek ({MAX_WORKERS} потоков)...")
+    extracted_data = []
+    
+    def thread_ocr_worker(f_name):
+        f_path = os.path.join(INPUT_DIR, f_name)
+        try:
+            logging.info(f"⏳ Отправка на OCR: {f_name} ...")
+            text = ocr_image_to_text(f_path)
+            if not text.strip():
+                logging.info(f"🖼️ {f_name} -> Текст отсутствует. Помечен как графика.")
+                return {"filename": f_path, "text": "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"}
+            logging.info(f"✅ {f_name} -> Успешно оцифрован")
+            return {"filename": f_path, "text": text}
+        except Exception as e:
+            logging.error(f"❌ Сбой OCR для файла {f_name}: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = executor.map(thread_ocr_worker, valid_filenames)
+        for res in results:
+            if res is not None:
+                extracted_data.append(res)
+
+    if not extracted_data:
+        logging.error("❌ Не удалось распознать ни один файл. Завершение работы.")
+        return
+
+    logging.info("🧠 ЭТАП 2: Подготовка данных и сортировка структуры Джеммой...")
+    
+    # МАСКИРОВКА И ПЕРЕИНДЕКСАЦИЯ
+    temp_mapping = {}
+    for i, item in enumerate(extracted_data):
+        clean_name = f"FILE_{i:03d}.jpg"
+        temp_mapping[clean_name] = os.path.basename(item['filename'])
+        item['filename'] = clean_name 
+    
+    grouped_files = group_files_with_gemma(extracted_data)
+    
+    # ВОССТАНОВЛЕНИЕ НАСТОЯЩИХ ИМЕН ФАЙЛОВ
+    restored_grouped = []
+    for group in grouped_files:
+        restored_group = [temp_mapping[f] for f in group if f in temp_mapping]
+        if restored_group:
+            restored_grouped.append(restored_group)
+    
+    grouped_files = restored_grouped 
+    logging.info(f"🧩 Сформировано {len(grouped_files)} независимых документов.")
+
+    logging.info("📦 ЭТАП 3: Визуальный анализ бланков и распределение по папкам...")
+    for idx, group in enumerate(grouped_files, 1):
+        if not group:
+            continue
+        first_file_name = group[0]
+        first_file_path = os.path.join(INPUT_DIR, first_file_name)
+        
+        file_data = next((item for item in extracted_data if temp_mapping.get(os.path.basename(item['filename'])) == first_file_name or os.path.basename(item['filename']) == first_file_name), None)
+        is_pure_graphic = file_data and file_data['text'] == "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"
+        
+        doc_type = analyze_document_by_image(first_file_path, allowed_types)
+        
+        if doc_type in ("НЕИЗВЕСТНО", "ОШИБКА"):
+            doc_type = "Чертежи и Графика (Без текста)" if is_pure_graphic else "Нераспознанные документы"
+            
+        # БРОНЯ ОТ СПЕЦСИМВОЛОВ: Очищаем имя документа до формирования пути
+        doc_type = sanitize_folder_name(doc_type)
+            
+        # УМНЫЙ СБОР ИНДЕКСОВ СТРАНИЦ
+        nums = []
+        for f in group:
+            all_digits = re.findall(r'\d+', f)
+            if all_digits:
+                nums.append(int(all_digits[-1]))
+        
+        range_str = f"{min(nums)}-{max(nums)}" if len(nums) > 1 else f"{nums[0] if nums else idx}"
+        
+        time.sleep(1.5)
+        
+        safe_folder = sanitize_folder_name(f"{idx} {doc_type}")
+        target_folder = OUTPUT_DIR / safe_folder
+        target_folder.mkdir(parents=True, exist_ok=True)
+        
+        final_pdf_name = f"{range_str} {doc_type}"
+        if merge_and_save_pdfs(group, INPUT_DIR, target_folder, final_pdf_name):
+            logging.info(f"🗂️ Документ {idx}/{len(grouped_files)}: Группа {range_str} успешно упакована в '{safe_folder}'")
+        else:
+            logging.error(f"❌ Документ {idx}: Ошибка при формировании файла {final_pdf_name}")
+
+    logging.info(f"🎉 ВСЕ ЭТАПЫ УСПЕШНО ЗАВЕРШЕНЫ! Результаты сохранены в папке '{OUTPUT_DIR.name}'.")
+
+if __name__ == "__main__":
+    main()

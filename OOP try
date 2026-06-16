@@ -1,0 +1,286 @@
+import os
+import base64
+import requests
+import re
+import fitz
+import json
+import logging
+import pandas as pd
+from pathlib import Path
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Отключаем предупреждения о небезопасном соединении
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class SystemConfig:
+    """Модуль управления конфигурацией и окружением."""
+    def __init__(self):
+        load_dotenv()
+        self.ocr_key = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")      
+        self.gemma_key = os.getenv("GEMMA_KEY", "sk-fbC7zz7k4rX5mvQsdA7IcA")    
+        self.api_url = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
+        self.max_workers = int(os.getenv("MAX_WORKERS", 5))
+
+        self.base_dir = Path(__file__).parent.resolve()
+        self.input_dir = self.base_dir / "berik"  
+        self.output_dir = self.base_dir / "docs"  
+        self.excel_file = self.base_dir / "types.xlsx"
+
+    def initialize_directories(self):
+        self.input_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(exist_ok=True)
+
+    def get_allowed_document_types(self) -> list:
+        """Извлечение классификатора из Excel-таблицы."""
+        if not self.excel_file.exists():
+            logging.warning(f"⚠️ Файл {self.excel_file.name} не найден. Классификация будет работать без строгого списка.")
+            return []
+        
+        try:
+            df = pd.read_excel(self.excel_file)
+            column_name = "Название документа"
+            if column_name in df.columns:
+                raw_list = df[column_name].dropna().astype(str).str.strip().unique().tolist()
+                allowed_types = [t for t in raw_list if t and not t.startswith("№")]
+                logging.info(f"✅ Успешно загружен Excel-файл ({len(allowed_types)} категорий).")
+                return allowed_types
+        except Exception as e:
+            logging.error(f"⚠️ Ошибка чтения Excel файла: {e}")
+        return []
+
+
+class FileOperations:
+    """Модуль для физических операций с файлами и PDF."""
+    @staticmethod
+    def sanitize_name(name: str) -> str:
+        return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+    @staticmethod
+    def encode_to_base64(file_path: str) -> str:
+        if str(file_path).lower().endswith('.pdf'):
+            doc = fitz.open(file_path)
+            page = doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_bytes = pix.tobytes("jpeg")
+            doc.close()
+            return base64.b64encode(img_bytes).decode('utf-8')
+        else:
+            with open(file_path, "rb") as f:
+                return base64.b64encode(f.read()).decode('utf-8')
+
+    @staticmethod
+    def merge_and_save_pdfs(files_list: list, source_dir: Path, target_folder: Path, final_name: str) -> bool:
+        merged_pdf = fitz.open()
+        for f_name in files_list:
+            f_path = os.path.join(source_dir, f_name)
+            if f_name.lower().endswith('.pdf'):
+                temp_doc = fitz.open(f_path)
+                merged_pdf.insert_pdf(temp_doc)
+                temp_doc.close()
+            else:
+                img_doc = fitz.open(f_path)
+                pdf_bytes = img_doc.convert_to_pdf()
+                temp_doc = fitz.open("pdf", pdf_bytes)
+                merged_pdf.insert_pdf(temp_doc)
+                temp_doc.close()
+                img_doc.close()
+                
+        merged_pdf.save(os.path.join(target_folder, f"{final_name}.pdf"))
+        merged_pdf.close()
+        return True
+
+
+class AIEngine:
+    """Модуль связи с внешними когнитивными системами."""
+    def __init__(self, config: SystemConfig, file_ops: FileOperations):
+        self.config = config
+        self.file_ops = file_ops
+        self.session = self._build_robust_session()
+
+    def _build_robust_session(self) -> requests.Session:
+        session = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        return session
+
+    def perform_ocr(self, file_path: str) -> str:
+        img_b64 = self.file_ops.encode_to_base64(file_path)
+        payload = {
+            "model": "deepseek-ocr",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Extract all text from this image. Return ONLY the text."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+            ]}],
+            "temperature": 0.0,
+            "max_tokens": 3000  
+        }
+        headers = {"Authorization": f"Bearer {self.config.ocr_key}", "Content-Type": "application/json"}
+        resp = self.session.post(self.config.api_url, headers=headers, json=payload, verify=False, timeout=60)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    def group_documents(self, extracted_data: list) -> list:
+        docs_info = ""
+        for item in extracted_data:
+            text = item['text']
+            short_text = text[:700] + " ... " + text[-700:] if len(text) > 1400 else text
+            docs_info += f"ФАЙЛ: {os.path.basename(item['filename'])}\nТЕКСТ:\n{short_text}\n\n"
+        
+        system_prompt = """Ты экспертный сортировщик документов. Перед тобой тексты страниц в хронологическом порядке. Твоя задача — распределить их по группам, строго соблюдая иерархию правил.
+            0. АБСОЛЮТНЫЙ ПРИОРИТЕТ (МОНОЛИТ "ЗЕМЛЕУСТРОИТЕЛЬНЫЙ ПРОЕКТ, ОПИСЬ, ЗЕМЕЛЬНО-КАДАСТРОВОЕ ДЕЛО, СОДЕРЖАНИЕ"): Если ты видишь в тексте 'Землеустроительный проект' или 'Раздел 0', ты ОБЯЗАН склеить этот лист и абсолютно все последующие листы в один гигантский документ. Эта непрерывная склейка включает в себя ВСЕ листы вплоть до того файла, который идет ровно перед листом 'Бланк заказа'. Лист 'Бланк заказа' отрезается и начинает новый отдельный документ.
+            ИГНОРИРУЙ ПРОПУСКИ: Если нумерация файлов идет так: 53 -> 55, а 54 отсутствует — это не повод разрывать проект. Считай, что 55 идет сразу после 53.
+            1. ВЫСШИЙ ПРИОРИТЕТ РАЗДЕЛЕНИЯ (КОЛОНТИТУЛЫ И ЗАГОЛОВКИ): Вне правила 0, любые колонтитулы и заголовки ('ЗАЯВЛЕНИЕ', 'ӨТІНІШ', 'ДОГОВОР', 'АКТ', 'СПРАВКА') имеют максимальную силу. Это 100% старт нового документа. Никакие другие маркеры не могут отменить это разделение.
+            2. ВЫСШИЙ ПРИОРИТЕТ СКЛЕЙКИ (ЛОГОТИПЫ): Если четкого титула нет, но присутствует редкий стилизованный логотип компании/проекта — эти листы 100% идут вместе. Это правило перебивает простую текстовую нумерацию или графику.
+            3. ИСКЛЮЧЕНИЕ ДЛЯ СТАНДАРТНЫХ БЛАНКОВ: Обычные текстовые шапки (реквизиты) на заявлениях не склеивай.
+            4. ПРОДОЛЖЕНИЕ ТЕКСТА: Если нет колонтитулов и логотипов, а текст содержит 'Страница 2' — крепи его к предыдущему файлу.
+            5. ГРАФИКА: Файлы '[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]' остаются одиночными (кроме случаев из пункта 0, там они вклеиваются в проект).
+            Не забывай = Сначала титул, потом остальное. Огромный титул = ОТДЕЛЬНЫЙ ДОК ВНЕ ПУНКТА НОЛЬ
+            Верни ТОЛЬКО валидный JSON в формате списка списков. Например: [["file1.jpg"], ["file2.jpg", "file3.jpg"]]"""
+
+        payload = {
+            "model": "gemma4",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": docs_info}
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1500
+        }
+        try:
+            headers = {"Authorization": f"Bearer {self.config.gemma_key}", "Content-Type": "application/json"}
+            resp = self.session.post(self.config.api_url, headers=headers, json=payload, verify=False, timeout=60)
+            resp.raise_for_status()
+            answer = resp.json()["choices"][0]["message"]["content"]
+            json_match = re.search(r'\[.*\]', answer, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return [[os.path.basename(item['filename'])] for item in extracted_data]
+        except Exception as e:
+            logging.error(f"Ошибка сортировки Джеммой: {e}")
+            return [[os.path.basename(item['filename'])] for item in extracted_data]
+
+    def classify_image(self, file_path: str, types_list: list) -> str:
+        img_b64 = self.file_ops.encode_to_base64(file_path)
+        if types_list:
+            numbered_types = [f"{i+1}. {t}" for i, t in enumerate(types_list)]
+            types_str = "\n".join(numbered_types)
+            system_prompt = (
+                f"Ты строгий визуальный классификатор документов. Перед тобой список разрешенных категорий из Excel:\n{types_str}\n\n"
+                f"Внимательно посмотри на изображение документа и определи его тип. НЕ СОЗДАВАЙ ЛИШНИХ ПАПОК = ОДИНАКОВЫЕ ПАПКИ = НАДО СЛОЖИТЬ В 1 ФАЙЛ\n"
+                f"Учитывай казахский язык (ӨТІНІШ -> Заявление). Если это чертеж/схема без текста — выбери подходящую категорию.\n"
+                f"В качестве ответа верни ТОЛЬКО ЦИФРУ номера пункта."
+            )
+        else:
+            system_prompt = "Посмотри на картинку и определи тип документа. Верни только одно-два слова на русском языке."
+
+        payload = {
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+            ]}],
+            "temperature": 0.0,
+            "max_tokens": 5  
+        }
+        try:
+            headers = {"Authorization": f"Bearer {self.config.gemma_key}", "Content-Type": "application/json"}
+            resp = self.session.post(self.config.api_url, headers=headers, json=payload, verify=False, timeout=45)
+            resp.raise_for_status()
+            raw_answer = resp.json()["choices"][0]["message"]["content"].strip()
+            match = re.search(r'\d+', raw_answer)
+            if types_list and match:
+                index = int(match.group(0)) - 1
+                if 0 <= index < len(types_list):
+                    return types_list[index]
+            return "НЕИЗВЕСТНО"
+        except Exception as e:
+            logging.error(f"Ошибка визуальной классификации: {e}")
+            return "ОШИБКА"
+
+
+class PipelineOrchestrator:
+    """Главный координатор обработки данных."""
+    def __init__(self):
+        self.config = SystemConfig()
+        self.file_ops = FileOperations()
+        self.ai = AIEngine(self.config, self.file_ops)
+
+    def execute_pipeline(self):
+        self.config.initialize_directories()
+        
+        valid_filenames = [f for f in os.listdir(self.config.input_dir) 
+                           if os.path.isfile(os.path.join(self.config.input_dir, f)) and not f.startswith('.')]
+        
+        if not valid_filenames:
+            logging.error(f"❌ Папка {self.config.input_dir.name} пуста. Пожалуйста, добавьте документы.")
+            return
+
+        logging.info(f"📥 Найдено файлов для обработки: {len(valid_filenames)}")
+        allowed_types = self.config.get_allowed_document_types()
+
+        # ЭТАП 1: Распознавание
+        logging.info("👁️ ЭТАП 1: Запуск параллельного OCR...")
+        extracted_data = []
+
+        def worker_task(f_name):
+            f_path = os.path.join(self.config.input_dir, f_name)
+            try:
+                text = self.ai.perform_ocr(f_path)
+                return {"filename": f_path, "text": text if text.strip() else "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"}
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            results = executor.map(worker_task, valid_filenames)
+            for res in results:
+                if res is not None:
+                    extracted_data.append(res)
+
+        # ЭТАП 2: Сортировка с маппингом
+        logging.info("🧠 ЭТАП 2: Подготовка данных и сортировка...")
+        temp_mapping = {}
+        for i, item in enumerate(extracted_data):
+            clean_name = f"FILE_{i:03d}.jpg"
+            temp_mapping[clean_name] = os.path.basename(item['filename'])
+            item['filename'] = clean_name 
+        
+        grouped_files_raw = self.ai.group_documents(extracted_data)
+        
+        restored_grouped = []
+        for group in grouped_files_raw:
+            restored_group = [temp_mapping[f] for f in group if f in temp_mapping]
+            if restored_group:
+                restored_grouped.append(restored_group)
+        
+        grouped_files = restored_grouped
+        logging.info(f"🧩 Сформировано {len(grouped_files)} документов.")
+
+        # ЭТАП 3: Сборка
+        logging.info("📦 ЭТАП 3: Итоговая сборка...")
+        for idx, group in enumerate(grouped_files, 1):
+            if not group: continue
+            
+            nums = [int(re.search(r'\d+', f).group()) for f in group if re.search(r'\d+', f)]
+            range_str = f"{min(nums)}-{max(nums)}" if len(nums) > 1 else f"{nums[0] if nums else idx}"
+            
+            doc_type = self.ai.classify_image(os.path.join(self.config.input_dir, group[0]), allowed_types)
+            
+            safe_folder = self.file_ops.sanitize_name(f"{idx} {doc_type}")
+            target_folder = self.config.output_dir / safe_folder
+            target_folder.mkdir(parents=True, exist_ok=True)
+            
+            self.file_ops.merge_and_save_pdfs(group, self.config.input_dir, target_folder, f"{range_str} {doc_type}")
+            logging.info(f"🗂️ Документ {idx}: Группа {range_str} сохранена как '{range_str} {doc_type}.pdf'")
+
+        logging.info("🎉 ВСЕ ЭТАПЫ ЗАВЕРШЕНЫ.")
+
+
+if __name__ == "__main__":
+    jarvis_system = PipelineOrchestrator()
+    jarvis_system.execute_pipeline()
