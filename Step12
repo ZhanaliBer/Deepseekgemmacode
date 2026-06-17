@@ -24,8 +24,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv()
 
 # Ключи и настройки API
-OCR_KEY = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")
-GEMMA_KEY = os.getenv("GEMMA_KEY", "sk-YuIk9jJ94NJg-3lDarn6LQ")    
+OCR_KEY = os.getenv("OCR_KEY")
+GEMMA_KEY = os.getenv("GEMMA_KEY")    
+QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 URL = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
 
 # Локальные директории
@@ -215,7 +216,7 @@ def get_file_as_base64(file_path):
 def ocr_image_to_text(file_path):
     img_b64 = get_file_as_base64(file_path)
     payload = {
-        "model": "deepseek-ocr",
+        "model": "qwen3-6",
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "Extract all text from this image. Return ONLY the text."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
@@ -223,7 +224,7 @@ def ocr_image_to_text(file_path):
         "temperature": 0.0,
         "max_tokens": 3000
     }
-    headers = {"Authorization": f"Bearer {OCR_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
     resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=60)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]

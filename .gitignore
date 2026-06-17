@@ -1,3 +1,5 @@
 docs/
 .env
 06092002077/
+temp/
+__pycache__/
