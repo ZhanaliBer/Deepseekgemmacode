@@ -72,14 +72,14 @@ def split_land_project_files(txt_files):
             break
 
     if end_idx is None:
-        logging.warning("⚠️ Найден 'Землеустроительный проект', но не найден 'Бланк заказа'. Диапазон не вырезан из анализа Gemma.")
+        logging.warning("⚠️ Найден 'Землеустроительный проект', но не найден 'Бланк заказа'. Диапазон не вырезан из анализа Qwen.")
         return txt_files, None
 
     project_files = txt_files[start_idx:end_idx]
 
     pdf_numbers = [extract_file_number(file_name) for file_name in project_files]
     if any(number is None for number in pdf_numbers):
-        logging.warning("⚠️ Не удалось определить номера PDF для блока 'Землеустроительный проект'. Диапазон не вырезан из анализа Gemma.")
+        logging.warning("⚠️ Не удалось определить номера PDF для блока 'Землеустроительный проект'. Диапазон не вырезан из анализа Qwen.")
         return txt_files, None
 
     manual_folder = {
@@ -91,13 +91,13 @@ def split_land_project_files(txt_files):
             }
         ]
     }
-    gemma_files = txt_files[:start_idx] + txt_files[end_idx:]
+    qwen_files = txt_files[:start_idx] + txt_files[end_idx:]
 
     logging.info(
         f"📌 Блок 'Землеустроительный проект' найден: PDF {pdf_numbers}. "
-        "Этот диапазон не будет отправлен Gemma и будет добавлен в JSON вручную."
+        "Этот диапазон не будет отправлен Qwen и будет добавлен в JSON вручную."
     )
-    return gemma_files, manual_folder
+    return qwen_files, manual_folder
 
 def save_structure_json(json_data):
     sort_structure_by_pdf_numbers(json_data)
@@ -122,6 +122,18 @@ def save_structure_json(json_data):
 
     return json_data
 
+def add_folder_to_structure(json_data, folder):
+    folder_name = folder.get("name", "").strip()
+    if not folder_name:
+        return
+
+    for existing_folder in json_data.setdefault("files", []):
+        if existing_folder.get("name") == folder_name:
+            existing_folder.setdefault("content", []).extend(folder.get("content", []))
+            return
+
+    json_data.setdefault("files", []).append(folder)
+
 def get_first_pdf_number(item):
     numbers = []
 
@@ -139,66 +151,23 @@ def sort_structure_by_pdf_numbers(json_data):
 
     json_data.get("files", []).sort(key=get_first_pdf_number)
 
-def find_act_ranges(txt_files):
+def split_act_span_files(txt_files):
     act_positions = [
         idx for idx, file_name in enumerate(txt_files)
         if "акт на земельный участок" in file_name.lower()
     ]
 
-    ranges = []
-    idx = 0
-    while idx + 1 < len(act_positions):
-        start_idx = act_positions[idx]
-        end_idx = act_positions[idx + 1]
-        pdf_numbers = [extract_file_number(file_name) for file_name in txt_files[start_idx:end_idx + 1]]
+    if len(act_positions) < 2:
+        return txt_files, []
 
-        if all(number is not None for number in pdf_numbers):
-            ranges.append(pdf_numbers)
+    start_idx = act_positions[0]
+    end_idx = act_positions[-1]
+    act_span_files = txt_files[start_idx:end_idx + 1]
+    qwen_files = txt_files[:start_idx] + txt_files[end_idx + 1:]
+    pdf_numbers = [extract_file_number(file_name) for file_name in act_span_files]
 
-        idx += 2
-
-    return ranges
-
-def remove_pdf_numbers_from_structure(json_data, pdf_numbers):
-    blocked_numbers = set(pdf_numbers)
-    folders = []
-
-    for folder in json_data.get("files", []):
-        content = []
-        for document in folder.get("content", []):
-            remaining_pdfs = [
-                number for number in document.get("pdfs", [])
-                if number not in blocked_numbers
-            ]
-            if remaining_pdfs:
-                updated_document = dict(document)
-                updated_document["pdfs"] = remaining_pdfs
-                content.append(updated_document)
-
-        if content:
-            updated_folder = dict(folder)
-            updated_folder["content"] = content
-            folders.append(updated_folder)
-
-    json_data["files"] = folders
-
-def apply_act_range_hardcode(json_data, txt_files):
-    act_ranges = find_act_ranges(txt_files)
-    if not act_ranges:
-        return
-
-    for pdf_numbers in act_ranges:
-        remove_pdf_numbers_from_structure(json_data, pdf_numbers)
-        json_data.setdefault("files", []).append({
-            "name": "Акт на земельный участок",
-            "content": [
-                {
-                    "name": "Акт на земельный участок.pdf",
-                    "pdfs": pdf_numbers
-                }
-            ]
-        })
-        logging.info(f"📌 Акт на земельный участок собран хардкодом: PDF {pdf_numbers}")
+    logging.info(f"📌 Диапазон актов вынесен в отдельный AI-разбор: PDF {pdf_numbers}")
+    return qwen_files, act_span_files
 
 def get_file_as_base64(file_path):
     if str(file_path).lower().endswith('.pdf'):
@@ -286,6 +255,219 @@ def process_input_file(idx, total_files, file_name, allowed_types):
 
     return idx, safe_filename, extracted_text
 
+def get_temp_document_name(file_name):
+    name = Path(file_name).stem
+    name = re.sub(r'^\d+\s*', '', name).strip()
+    return name or Path(file_name).stem
+
+def shorten_document_text(text):
+    text = text.strip()
+    if len(text) > 1000:
+        return text[:500] + "\n...[ТЕКСТ СОКРАЩЕН]...\n" + text[-500:]
+
+    return text
+
+def build_docs_info(file_names):
+    docs_info = ""
+
+    for file_name in file_names:
+        file_path = TEMP_DIR / file_name
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        docs_info += f"ФАЙЛ: {file_name}\nТЕКСТ:\n{shorten_document_text(text)}\n\n"
+
+    return docs_info
+
+def clean_model_json_answer(answer):
+    answer = answer.strip()
+    if answer.startswith("```json"):
+        answer = answer.replace("```json\n", "", 1)
+    if answer.startswith("```"):
+        answer = answer.replace("```\n", "", 1)
+    if answer.endswith("```"):
+        answer = answer[:-3]
+
+    return answer.strip()
+
+def get_choice_text(response_json):
+    choice = response_json["choices"][0]
+    message = choice.get("message", {})
+    content = message.get("content")
+    if content:
+        return content
+
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        return reasoning_content
+
+    return None
+
+def generate_folder_json(folder_name, file_names):
+    docs_info = build_docs_info(file_names)
+    system_prompt = f"""Ты архитектор данных. Ты анализируешь только один тип документа: "{folder_name}".
+
+Твоя задача — решить, какие страницы этого типа должны быть отдельными PDF, а какие надо сшить вместе.
+
+ПРАВИЛА:
+1. Верни JSON только для ОДНОЙ папки.
+2. Значение "name" верхнего объекта всегда строго "{folder_name}". Не меняй и не придумывай название папки.
+3. Не создавай массив "files" и не создавай несколько папок.
+4. В "content" добавляй отдельные документы этого типа:
+   - СШИВАЙ подряд идущие файлы в один "pdfs", если текст логически продолжается.
+   - РАЗДЕЛЯЙ на разные объекты "content", если видишь начало нового документа: новую шапку, ФИО, реквизиты, дату, печать или повторное название документа.
+5. "name" внутри "content" должен быть названием PDF для этого документа. Обычно используй "{folder_name}.pdf".
+
+Верни ТОЛЬКО валидный JSON без markdown-разметки. Формат:
+{{
+    "name": "{folder_name}",
+    "content": [
+        {{
+            "name": "{folder_name}.pdf",
+            "pdfs": [1, 2]
+        }},
+        {{
+            "name": "{folder_name}.pdf",
+            "pdfs": [3]
+        }}
+    ]
+}}"""
+
+    payload = {
+        "model": "qwen3-6",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": docs_info}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 25000
+    }
+
+    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+    resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=300)
+    resp.raise_for_status()
+
+    raw_answer = get_choice_text(resp.json())
+    if not raw_answer:
+        raise ValueError(f"Пустой ответ модели для группы '{folder_name}'")
+
+    answer = clean_model_json_answer(raw_answer)
+    folder_data = json.loads(answer)
+
+    if "files" in folder_data:
+        files = folder_data.get("files", [])
+        if len(files) != 1:
+            raise ValueError(f"Модель вернула {len(files)} папок для группы {folder_name}")
+        folder_data = files[0]
+
+    folder_data["name"] = folder_name
+    return folder_data
+
+def analyze_act_span_files(file_names):
+    docs_info = build_docs_info(file_names)
+    system_prompt = """Ты архитектор данных. Ты анализируешь непрерывный диапазон файлов от первого до последнего файла с названием "Акт на земельный участок".
+
+Внутри диапазона могут быть:
+- один или несколько документов "Акт на земельный участок";
+- файлы с другими названиями, которые могут быть вложением/продолжением акта;
+- файлы с другими названиями, которые НЕ относятся к акту и должны вернуться в дальнейший разбор по своему названию.
+
+Твоя задача — определить только состав актов. Не создавай папки для других документов.
+
+ПРАВИЛА:
+1. Если файл с другим названием логически относится к акту между страницами акта, включай его в "pdfs" этого акта.
+2. Если файл с другим названием НЕ относится к акту, добавь его номер в "return_pdfs".
+3. По содержанию реши, это один акт с вложениями/продолжениями или несколько разных актов.
+4. Каждый объект в массиве "content" — это один отдельный итоговый PDF с актом.
+5. Если страницы относятся к одному акту, помести их в один объект "content" с общим "pdfs".
+6. Если это несколько разных актов, верни несколько объектов "content".
+7. Каждый номер файла из входа должен быть либо в одном из "content[].pdfs", либо в "return_pdfs".
+8. Не создавай папки и не решай названия для документов, которые не относятся к акту.
+
+Верни ТОЛЬКО валидный JSON без markdown-разметки. Формат:
+{
+    "content": [
+        {
+            "name": "Акт на земельный участок.pdf",
+            "pdfs": [57, 58, 59]
+        },
+        {
+            "name": "Акт на земельный участок.pdf",
+            "pdfs": [62]
+        }
+    ],
+    "return_pdfs": [
+        60,
+        61
+    ]
+}"""
+
+    payload = {
+        "model": "qwen3-6",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": docs_info}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 25000
+    }
+
+    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+    resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=300)
+    resp.raise_for_status()
+
+    raw_answer = get_choice_text(resp.json())
+    if not raw_answer:
+        raise ValueError("Пустой ответ модели для диапазона актов")
+
+    answer = clean_model_json_answer(raw_answer)
+    act_data = json.loads(answer)
+
+    file_by_number = {
+        extract_file_number(file_name): file_name
+        for file_name in file_names
+        if extract_file_number(file_name) is not None
+    }
+    input_numbers = set(file_by_number)
+    act_numbers = set()
+    content = []
+
+    for document in act_data.get("content", []):
+        pdf_numbers = [
+            number for number in document.get("pdfs", [])
+            if number in input_numbers
+        ]
+        if not pdf_numbers:
+            continue
+
+        act_numbers.update(pdf_numbers)
+        content.append({
+            "name": document.get("name") or "Акт на земельный участок.pdf",
+            "pdfs": pdf_numbers
+        })
+
+    return_numbers = {
+        number for number in act_data.get("return_pdfs", [])
+        if number in input_numbers
+    }
+    missing_numbers = input_numbers - act_numbers - return_numbers
+    return_numbers.update(missing_numbers)
+
+    act_folder = None
+    if content:
+        act_folder = {
+            "name": "Акт на земельный участок",
+            "content": content
+        }
+
+    returned_files = [
+        file_by_number[number]
+        for number in sorted(return_numbers)
+        if number in file_by_number
+    ]
+
+    return act_folder, returned_files
+
 # ЭТАП 3: Анализ структуры на основе текста
 # ЭТАП 3: Анализ структуры на основе текста
 def generate_structure_json():
@@ -298,89 +480,49 @@ def generate_structure_json():
         logging.error("❌ Папка temp пуста. Выполнение невозможно.")
         return None
 
-    txt_files, manual_folder = split_land_project_files(txt_files)
-
-    if not txt_files and manual_folder:
-        return save_structure_json({"files": [manual_folder]})
-
-    docs_info = ""
-    for f_name in txt_files:
-        file_path = TEMP_DIR / f_name
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read().strip()
-            
-        # Передаем начало и конец текста для выявления "шапок" и "подписей"
-        if len(text) > 1000:
-            short_text = text[:500] + "\n...[ТЕКСТ СОКРАЩЕН]...\n" + text[-500:]
-        else:
-            short_text = text
-            
-        docs_info += f"ФАЙЛ: {f_name}\nТЕКСТ:\n{short_text}\n\n"
-
-    system_prompt = """Ты архитектор данных. Твоя задача — проанализировать тексты страниц и сгруппировать их в строгий JSON.
-
-ПРАВИЛА АНАЛИЗА И СШИВАНИЯ (КРИТИЧЕСКИ ВАЖНО):
-1. Анализ текста (Разделяй и властвуй):
-   - Если файлы идут подряд и относятся к одному типу (например, четыре файла "Заявление"), ВНИМАТЕЛЬНО ИЗУЧИ ТЕКСТ.
-   - СШИВАЙ их в один массив (например, "pdfs": [1, 2]), ТОЛЬКО если текст логически перетекает (на первой странице нет подписи, а на второй нет новой "шапки" Кому/От кого).
-   - РАЗДЕЛЯЙ их на разные документы (разные объекты внутри "content"), если видишь начало нового документа: новую шапку (ФИО, реквизиты), дату, новую печать или повторное слово "ЗАЯВЛЕНИЕ" в начале страницы. В таком случае делай два разных документа, например "pdfs": [1, 2] и "pdfs": [3, 4].
-2. Жесткое именование:
-   - Значение "name" для папки ДОЛЖНО СТРОГО совпадать с названием самого документа. Никаких выдуманных названий! Если файлы называются "Заявление", папка должна называться "Заявление".
-
-Верни ТОЛЬКО валидный JSON без markdown-разметки. Формат:
-{
-    "files": [
-        {
-            "name": "Точное_название_документа",
-            "content": [
-                {
-                    "name": "Название_документа.pdf",
-                    "pdfs": [1, 2]
-                },
-                {
-                    "name": "Название_документа.pdf",
-                    "pdfs": [3, 4]
-                }
-            ]
-        }
-    ]
-}"""
-
-    payload = {
-        "model": "gemma4",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": docs_info}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 12000
-    }
-
     try:
-        headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
-        resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=300)
-        resp.raise_for_status()
-        answer = resp.json()["choices"][0]["message"]["content"].strip()
-        raw_answer_path = BASE_DIR / "gemma_stage3_raw_answer.json"
-        with open(raw_answer_path, 'w', encoding='utf-8') as f:
-            f.write(answer)
-        
-        # Очистка от маркдауна
-        if answer.startswith("```json"):
-            answer = answer.replace("```json\n", "", 1)
-        if answer.endswith("```"):
-            answer = answer[:-3]
-            
-        json_data = json.loads(answer)
-        if manual_folder:
-            json_data.setdefault("files", []).append(manual_folder)
+        txt_files, manual_folder = split_land_project_files(txt_files)
 
-        apply_act_range_hardcode(json_data, txt_files)
+        txt_files, act_span_files = split_act_span_files(txt_files)
+        act_folder = None
+        if act_span_files:
+            logging.info(f"🧠 ЭТАП 3: отдельный разбор диапазона актов ({len(act_span_files)} файлов)")
+            act_folder, returned_files = analyze_act_span_files(act_span_files)
+            txt_files = sorted(
+                txt_files + returned_files,
+                key=lambda x: extract_file_number(x) or 0
+            )
+
+        if not txt_files and (manual_folder or act_folder):
+            json_data = {"files": []}
+            if act_folder:
+                add_folder_to_structure(json_data, act_folder)
+            if manual_folder:
+                add_folder_to_structure(json_data, manual_folder)
+            return save_structure_json(json_data)
+
+        grouped_files = {}
+        for file_name in txt_files:
+            folder_name = get_temp_document_name(file_name)
+            grouped_files.setdefault(folder_name, []).append(file_name)
+
+        json_data = {"files": []}
+
+        for folder_name, file_names in grouped_files.items():
+            logging.info(f"🧠 ЭТАП 3: группа '{folder_name}' ({len(file_names)} файлов)")
+            folder_data = generate_folder_json(folder_name, file_names)
+            add_folder_to_structure(json_data, folder_data)
+
+        if act_folder:
+            add_folder_to_structure(json_data, act_folder)
+
+        if manual_folder:
+            add_folder_to_structure(json_data, manual_folder)
 
         return save_structure_json(json_data)
 
     except json.JSONDecodeError:
-        logging.error(f"❌ Ошибка парсинга JSON. Ответ модели:\n{answer}")
+        logging.error("❌ Ошибка парсинга JSON в одной из групп этапа 3.")
         return None
     except Exception as e:
         logging.error(f"❌ Ошибка генерации структуры: {e}")
