@@ -8,8 +8,9 @@ import fitz
 
 BASE_DIR = Path(__file__).resolve().parent
 FORMAT_FILE = BASE_DIR / "structure.json"
-SOURCE_DIR = BASE_DIR / "06092002077"
+SOURCE_DIR = BASE_DIR / "berik"
 RESULT_DIR = BASE_DIR / "result"
+MAX_PREFIX_LENGTH = 80
 
 
 def extract_source_number(file_path):
@@ -66,6 +67,36 @@ def numbered_name(number, name):
     return f"{number}. {name}"
 
 
+def pdf_numbers_prefix(pdf_numbers):
+    if not pdf_numbers:
+        return "0"
+
+    ranges = []
+    start = pdf_numbers[0]
+    previous = pdf_numbers[0]
+
+    for number in pdf_numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+
+        ranges.append((start, previous))
+        start = number
+        previous = number
+
+    ranges.append((start, previous))
+
+    prefix = "_".join(
+        str(start) if start == end else f"{start}-{end}"
+        for start, end in ranges
+    )
+
+    if len(prefix) > MAX_PREFIX_LENGTH:
+        prefix = f"{pdf_numbers[0]}-{pdf_numbers[-1]}_count{len(pdf_numbers)}"
+
+    return prefix
+
+
 def main():
     with FORMAT_FILE.open("r", encoding="utf-8") as file:
         data = json.load(file)
@@ -81,8 +112,8 @@ def main():
         folder_path = RESULT_DIR / numbered_name(folder_index, folder["name"])
         folder_path.mkdir(parents=True, exist_ok=True)
 
-        for document_index, document in enumerate(folder["content"], 1):
-            output_name = numbered_name(document_index, document["name"])
+        for document in folder["content"]:
+            output_name = numbered_name(pdf_numbers_prefix(document["pdfs"]), document["name"])
             if not output_name.lower().endswith(".pdf"):
                 output_name += ".pdf"
 

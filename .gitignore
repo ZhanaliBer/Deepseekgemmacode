@@ -6,4 +6,5 @@ __pycache__/
 result/
 structure.json
 *.rar
+*.zip
 .vscode/
