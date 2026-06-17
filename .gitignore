@@ -4,3 +4,6 @@ docs/
 temp/
 __pycache__/
 result/
+structure.json
+*.rar
+.vscode/

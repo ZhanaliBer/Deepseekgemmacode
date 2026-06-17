@@ -8,7 +8,7 @@ import fitz
 
 BASE_DIR = Path(__file__).resolve().parent
 FORMAT_FILE = BASE_DIR / "structure.json"
-SOURCE_DIR = BASE_DIR / "berik"
+SOURCE_DIR = BASE_DIR / "06092002077"
 RESULT_DIR = BASE_DIR / "result"
 
 

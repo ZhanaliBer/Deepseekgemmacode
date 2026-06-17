@@ -31,7 +31,7 @@ URL = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
 
 # Локальные директории
 BASE_DIR = Path(__file__).parent.resolve()
-INPUT_DIR = BASE_DIR / "berik"  
+INPUT_DIR = BASE_DIR / "06092002077"  
 OUTPUT_DIR = BASE_DIR / "docs"  
 TEMP_DIR = BASE_DIR / "temp"    
 EXCEL_FILE = BASE_DIR / "types.xlsx"
