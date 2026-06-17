@@ -208,6 +208,7 @@ def analyze_document_by_image(file_path, types_list):
             f"Ты строгий визуальный классификатор документов. Перед тобой список разрешенных категорий из Excel:\n{types_str}\n\n"
             f"Внимательно посмотри на изображение документа и определи его тип.\n"
             f"Учитывай казахский язык (ӨТІНІШ -> Заявление). Если это чертеж/схема без текста — выбери подходящую категорию.\n"
+            f"Если на документе написано 'Раздел 0', 'раздел 0' или '0 раздел', выбирай категорию 'Нулевой раздел'.\n"
             f"В качестве ответа верни ТОЛЬКО ЦИФРУ номера пункта."
         )
     else:
@@ -260,6 +261,60 @@ def get_temp_document_name(file_name):
     name = re.sub(r'^\d+\s*', '', name).strip()
     return name or Path(file_name).stem
 
+def get_page_marker(text):
+    patterns = [
+        r'(?:страница|стр\.?|лист)\s*(\d+)\s*(?:из|/)\s*(\d+)',
+        r'\b(\d+)\s*(?:из|/)\s*(\d+)\b',
+        r'page\s*(\d+)\s*(?:of|/)\s*(\d+)'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            current_page = int(match.group(1))
+            total_pages = int(match.group(2))
+            if 1 <= current_page <= total_pages <= 50:
+                return current_page, total_pages
+
+    return None
+
+def find_numbered_page_groups(txt_files):
+    groups = []
+    index = 0
+
+    while index < len(txt_files):
+        first_path = TEMP_DIR / txt_files[index]
+        first_text = first_path.read_text(encoding='utf-8', errors='ignore')
+        marker = get_page_marker(first_text)
+
+        if not marker or marker[0] != 1:
+            index += 1
+            continue
+
+        total_pages = marker[1]
+        if index + total_pages > len(txt_files):
+            index += 1
+            continue
+
+        candidate_files = txt_files[index:index + total_pages]
+        is_full_sequence = True
+
+        for offset, file_name in enumerate(candidate_files):
+            text = (TEMP_DIR / file_name).read_text(encoding='utf-8', errors='ignore')
+            candidate_marker = get_page_marker(text)
+            expected_page = offset + 1
+            if candidate_marker != (expected_page, total_pages):
+                is_full_sequence = False
+                break
+
+        if is_full_sequence:
+            groups.append(candidate_files)
+            index += total_pages
+        else:
+            index += 1
+
+    return groups
+
 def shorten_document_text(text):
     text = text.strip()
     if len(text) > 1000:
@@ -303,6 +358,87 @@ def get_choice_text(response_json):
         return reasoning_content
 
     return None
+
+def confirm_same_numbered_document(file_names):
+    first_name = get_temp_document_name(file_names[0])
+    docs_info = build_docs_info(file_names)
+    system_prompt = f"""Ты проверяешь многостраничный документ.
+
+Первый файл классифицирован как: "{first_name}".
+Файлы идут подряд и имеют нумерацию страниц 1..N.
+
+Твоя задача — определить, являются ли все переданные файлы страницами одного документа "{first_name}".
+
+Верни ТОЛЬКО валидный JSON без markdown-разметки:
+{{
+    "same_document": true
+}}
+
+Если хотя бы один файл является началом другого документа или не относится к первому документу, верни:
+{{
+    "same_document": false
+}}"""
+
+    payload = {
+        "model": "gemma4",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": docs_info}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 100
+    }
+
+    headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
+    resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=120)
+    resp.raise_for_status()
+
+    raw_answer = get_choice_text(resp.json())
+    if not raw_answer:
+        return False
+
+    answer = clean_model_json_answer(raw_answer)
+    try:
+        data = json.loads(answer)
+    except json.JSONDecodeError:
+        return False
+
+    return bool(data.get("same_document"))
+
+def normalize_numbered_page_documents():
+    txt_files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.txt')]
+    txt_files.sort(key=lambda x: extract_file_number(x) or 0)
+
+    groups = find_numbered_page_groups(txt_files)
+    if not groups:
+        return
+
+    for file_names in groups:
+        first_name = get_temp_document_name(file_names[0])
+        if not first_name or first_name in {"НЕИЗВЕСТНО", "ОШИБКА"}:
+            continue
+
+        logging.info(f"📄 Проверка многостраничного документа '{first_name}': {file_names}")
+        if not confirm_same_numbered_document(file_names):
+            continue
+
+        for file_name in file_names[1:]:
+            file_number = extract_file_number(file_name)
+            if file_number is None:
+                continue
+
+            source_path = TEMP_DIR / file_name
+            target_name = sanitize_folder_name(f"{file_number} {first_name}") + ".txt"
+            target_path = TEMP_DIR / target_name
+
+            if source_path == target_path:
+                continue
+
+            if target_path.exists():
+                target_path.unlink()
+
+            source_path.rename(target_path)
+            logging.info(f"📄 Страница продолжения переименована: {file_name} -> {target_name}")
 
 def generate_folder_json(folder_name, file_names):
     docs_info = build_docs_info(file_names)
@@ -588,6 +724,8 @@ def main():
                 logging.info(f"💾 Слепок сохранен [{idx}/{total_files}]: {txt_filepath.name}")
 
         logging.info("✅ ЭТАПЫ 1 И 2 ЗАВЕРШЕНЫ. Тексты сохранены в папке temp.")
+
+    normalize_numbered_page_documents()
     
     # ЭТАП 3: Анализ структуры
     json_structure = generate_structure_json()
