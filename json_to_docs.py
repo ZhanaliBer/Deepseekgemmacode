@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import shutil
 
 import fitz
@@ -7,8 +8,40 @@ import fitz
 
 BASE_DIR = Path(__file__).resolve().parent
 FORMAT_FILE = BASE_DIR / "structure.json"
-SOURCE_DIR = BASE_DIR / "berik"
+SOURCE_DIR = BASE_DIR / "06092002077"
 RESULT_DIR = BASE_DIR / "result"
+
+
+def extract_source_number(file_path):
+    match = re.search(r'_(\d+)', file_path.stem)
+    if match:
+        return int(match.group(1))
+
+    if file_path.stem.isdigit():
+        return int(file_path.stem)
+
+    return None
+
+
+def normalize_source_pdfs():
+    created = 0
+    for source_path in list(SOURCE_DIR.glob("*.pdf")):
+        if source_path.stem.isdigit():
+            continue
+
+        number = extract_source_number(source_path)
+        if number is None:
+            continue
+
+        normalized_path = SOURCE_DIR / f"{number}.pdf"
+        if normalized_path.exists():
+            continue
+
+        source_path.rename(normalized_path)
+        created += 1
+
+    if created:
+        print(f"Нормализовано PDF-файлов: {created}")
 
 
 def merge_pdfs(pdf_numbers, output_path):
@@ -36,6 +69,8 @@ def numbered_name(number, name):
 def main():
     with FORMAT_FILE.open("r", encoding="utf-8") as file:
         data = json.load(file)
+
+    normalize_source_pdfs()
 
     if RESULT_DIR.exists():
         shutil.rmtree(RESULT_DIR)

@@ -6,8 +6,8 @@ import fitz
 import json
 import logging
 import pandas as pd
-import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import urllib3
 from requests.adapters import HTTPAdapter
@@ -24,16 +24,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv()
 
 # Ключи и настройки API
-OCR_KEY = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")      
+OCR_KEY = os.getenv("OCR_KEY", "sk-YkWj7z0GvobZjkGSDcZnTQ")
 GEMMA_KEY = os.getenv("GEMMA_KEY", "sk-YuIk9jJ94NJg-3lDarn6LQ")    
 URL = os.getenv("AI_URL", "https://llm.alem.ai/v1/chat/completions")
 
 # Локальные директории
 BASE_DIR = Path(__file__).parent.resolve()
-INPUT_DIR = BASE_DIR / "berik"  
+INPUT_DIR = BASE_DIR / "06092002077"  
 OUTPUT_DIR = BASE_DIR / "docs"  
 TEMP_DIR = BASE_DIR / "temp"    
 EXCEL_FILE = BASE_DIR / "types.xlsx"
+MAX_WORKERS = 5
 
 # Настройка HTTP-сессии (разрешены повторы для POST-запросов)
 session = requests.Session()
@@ -137,6 +138,67 @@ def sort_structure_by_pdf_numbers(json_data):
 
     json_data.get("files", []).sort(key=get_first_pdf_number)
 
+def find_act_ranges(txt_files):
+    act_positions = [
+        idx for idx, file_name in enumerate(txt_files)
+        if "акт на земельный участок" in file_name.lower()
+    ]
+
+    ranges = []
+    idx = 0
+    while idx + 1 < len(act_positions):
+        start_idx = act_positions[idx]
+        end_idx = act_positions[idx + 1]
+        pdf_numbers = [extract_file_number(file_name) for file_name in txt_files[start_idx:end_idx + 1]]
+
+        if all(number is not None for number in pdf_numbers):
+            ranges.append(pdf_numbers)
+
+        idx += 2
+
+    return ranges
+
+def remove_pdf_numbers_from_structure(json_data, pdf_numbers):
+    blocked_numbers = set(pdf_numbers)
+    folders = []
+
+    for folder in json_data.get("files", []):
+        content = []
+        for document in folder.get("content", []):
+            remaining_pdfs = [
+                number for number in document.get("pdfs", [])
+                if number not in blocked_numbers
+            ]
+            if remaining_pdfs:
+                updated_document = dict(document)
+                updated_document["pdfs"] = remaining_pdfs
+                content.append(updated_document)
+
+        if content:
+            updated_folder = dict(folder)
+            updated_folder["content"] = content
+            folders.append(updated_folder)
+
+    json_data["files"] = folders
+
+def apply_act_range_hardcode(json_data, txt_files):
+    act_ranges = find_act_ranges(txt_files)
+    if not act_ranges:
+        return
+
+    for pdf_numbers in act_ranges:
+        remove_pdf_numbers_from_structure(json_data, pdf_numbers)
+        json_data.setdefault("files", []).append({
+            "name": "Акт на земельный участок",
+            "content": [
+                {
+                    "name": "Акт на земельный участок.pdf",
+                    "pdfs": pdf_numbers
+                }
+            ]
+        })
+        logging.info(f"📌 Акт на земельный участок собран хардкодом: PDF {pdf_numbers}")
+
 def get_file_as_base64(file_path):
     if str(file_path).lower().endswith('.pdf'):
         doc = fitz.open(file_path)
@@ -159,7 +221,7 @@ def ocr_image_to_text(file_path):
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
         ]}],
         "temperature": 0.0,
-        "max_tokens": 3000  
+        "max_tokens": 3000
     }
     headers = {"Authorization": f"Bearer {OCR_KEY}", "Content-Type": "application/json"}
     resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=60)
@@ -205,6 +267,23 @@ def analyze_document_by_image(file_path, types_list):
     except Exception as e:
         logging.error(f"Ошибка визуальной классификации: {e}")
         return "ОШИБКА"
+
+def process_input_file(idx, total_files, file_name, allowed_types):
+    file_path = INPUT_DIR / file_name
+    logging.info(f"⚙️ Обработка [{idx}/{total_files}]: {file_name}")
+
+    try:
+        extracted_text = ocr_image_to_text(str(file_path))
+        if not extracted_text.strip():
+            extracted_text = "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"
+    except Exception as e:
+        logging.error(f"Ошибка чтения OCR для {file_name}: {e}")
+        extracted_text = "[ОШИБКА РАСПОЗНАВАНИЯ]"
+
+    doc_name = analyze_document_by_image(str(file_path), allowed_types)
+    safe_filename = sanitize_folder_name(f"{idx} {doc_name}")
+
+    return idx, safe_filename, extracted_text
 
 # ЭТАП 3: Анализ структуры на основе текста
 # ЭТАП 3: Анализ структуры на основе текста
@@ -273,14 +352,17 @@ def generate_structure_json():
             {"role": "user", "content": docs_info}
         ],
         "temperature": 0.0,
-        "max_tokens": 4000
+        "max_tokens": 12000
     }
 
     try:
         headers = {"Authorization": f"Bearer {GEMMA_KEY}", "Content-Type": "application/json"}
-        resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=120)
+        resp = session.post(URL, headers=headers, json=payload, verify=False, timeout=300)
         resp.raise_for_status()
         answer = resp.json()["choices"][0]["message"]["content"].strip()
+        raw_answer_path = BASE_DIR / "gemma_stage3_raw_answer.json"
+        with open(raw_answer_path, 'w', encoding='utf-8') as f:
+            f.write(answer)
         
         # Очистка от маркдауна
         if answer.startswith("```json"):
@@ -291,6 +373,8 @@ def generate_structure_json():
         json_data = json.loads(answer)
         if manual_folder:
             json_data.setdefault("files", []).append(manual_folder)
+
+        apply_act_range_hardcode(json_data, txt_files)
 
         return save_structure_json(json_data)
 
@@ -337,33 +421,26 @@ def main():
             for f in temp_files:
                 os.remove(TEMP_DIR / f)
 
-        logging.info(f"🚀 ЗАПУСК ЭТАПОВ 1 И 2: Обработка {total_files} файлов...")
-        for idx, f_name in enumerate(valid_filenames, 1):
-            f_path = INPUT_DIR / f_name
-            
-            # Аппаратная задержка
-            time.sleep(3) 
-            
-            logging.info(f"⚙️ Обработка [{idx}/{total_files}]: {f_name}")
-            
-            # ЭТАП 1: OCR
-            try:
-                extracted_text = ocr_image_to_text(str(f_path))
-                if not extracted_text.strip():
-                    extracted_text = "[ГРАФИЧЕСКИЙ ДОКУМЕНТ: ТЕКСТ ОТСУТСТВУЕТ]"
-            except Exception as e:
-                logging.error(f"Ошибка чтения OCR для {f_name}: {e}")
-                extracted_text = "[ОШИБКА РАСПОЗНАВАНИЯ]"
+        logging.info(f"🚀 ЗАПУСК ЭТАПОВ 1 И 2: Обработка {total_files} файлов в {MAX_WORKERS} воркеров...")
+        tasks = [
+            (idx, file_name)
+            for idx, file_name in enumerate(valid_filenames, 1)
+        ]
 
-            # ЭТАП 2: Gemma (Название)
-            doc_name = analyze_document_by_image(str(f_path), allowed_types)
-            
-            # Запись слепка
-            safe_filename = sanitize_folder_name(f"{idx} {doc_name}")
-            txt_filepath = TEMP_DIR / f"{safe_filename}.txt"
-            
-            with open(txt_filepath, 'w', encoding='utf-8') as f:
-                f.write(extracted_text)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [
+                executor.submit(process_input_file, idx, total_files, file_name, allowed_types)
+                for idx, file_name in tasks
+            ]
+
+            for future in as_completed(futures):
+                idx, safe_filename, extracted_text = future.result()
+                txt_filepath = TEMP_DIR / f"{safe_filename}.txt"
+
+                with open(txt_filepath, 'w', encoding='utf-8') as f:
+                    f.write(extracted_text)
+
+                logging.info(f"💾 Слепок сохранен [{idx}/{total_files}]: {txt_filepath.name}")
 
         logging.info("✅ ЭТАПЫ 1 И 2 ЗАВЕРШЕНЫ. Тексты сохранены в папке temp.")
     
