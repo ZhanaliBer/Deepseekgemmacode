@@ -272,10 +272,11 @@ def build_docs_info(file_names):
 
     for file_name in file_names:
         file_path = TEMP_DIR / file_name
+        file_number = extract_file_number(file_name)
         with open(file_path, 'r', encoding='utf-8') as f:
             text = f.read()
 
-        docs_info += f"ФАЙЛ: {file_name}\nТЕКСТ:\n{shorten_document_text(text)}\n\n"
+        docs_info += f"ФАЙЛ: {file_name}\nНОМЕР PDF: {file_number}\nТЕКСТ:\n{shorten_document_text(text)}\n\n"
 
     return docs_info
 
@@ -313,10 +314,11 @@ def generate_folder_json(folder_name, file_names):
 1. Верни JSON только для ОДНОЙ папки.
 2. Значение "name" верхнего объекта всегда строго "{folder_name}". Не меняй и не придумывай название папки.
 3. Не создавай массив "files" и не создавай несколько папок.
-4. В "content" добавляй отдельные документы этого типа:
+4. В "pdfs" пиши только числа из строк "НОМЕР PDF". Не используй номера из текста документа.
+5. В "content" добавляй отдельные документы этого типа:
    - СШИВАЙ подряд идущие файлы в один "pdfs", если текст логически продолжается.
    - РАЗДЕЛЯЙ на разные объекты "content", если видишь начало нового документа: новую шапку, ФИО, реквизиты, дату, печать или повторное название документа.
-5. "name" внутри "content" должен быть названием PDF для этого документа. Обычно используй "{folder_name}.pdf".
+6. "name" внутри "content" должен быть названием PDF для этого документа. Обычно используй "{folder_name}.pdf".
 
 Верни ТОЛЬКО валидный JSON без markdown-разметки. Формат:
 {{
