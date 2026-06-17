@@ -99,6 +99,24 @@ def split_land_project_files(txt_files):
     )
     return qwen_files, manual_folder
 
+def remove_remaining_land_project_files(txt_files):
+    qwen_files = []
+    removed_numbers = []
+
+    for file_name in txt_files:
+        if "землеустроительный проект" in file_name.lower():
+            number = extract_file_number(file_name)
+            if number is not None:
+                removed_numbers.append(number)
+            continue
+
+        qwen_files.append(file_name)
+
+    if removed_numbers:
+        logging.info(f"📌 Оставшиеся файлы 'Землеустроительный проект' исключены из анализа Qwen: PDF {removed_numbers}")
+
+    return qwen_files
+
 def save_structure_json(json_data):
     sort_structure_by_pdf_numbers(json_data)
 
@@ -482,6 +500,7 @@ def generate_structure_json():
 
     try:
         txt_files, manual_folder = split_land_project_files(txt_files)
+        txt_files = remove_remaining_land_project_files(txt_files)
 
         txt_files, act_span_files = split_act_span_files(txt_files)
         act_folder = None
